@@ -1,9 +1,11 @@
 '''Encode object boxes and labels.'''
 import math
 import torch
+import torchvision
 
-from utils import meshgrid, box_iou, box_nms, change_box_order
-
+from utils import meshgrid, box_iou, box_nms, change_box_order, numpy_nms
+import numpy as np
+from nonmaxsup import nms
 
 class DataEncoder:
     def __init__(self):
@@ -104,8 +106,8 @@ class DataEncoder:
           boxes: (tensor) decode box locations, sized [#obj,4].
           labels: (tensor) class labels for each box, sized [#obj,].
         '''
-        CLS_THRESH = 0.5
-        NMS_THRESH = 0.5
+        CLS_THRESH = 0.9
+        NMS_THRESH = 0.0
 
         input_size = torch.Tensor([input_size,input_size]) if isinstance(input_size, int) \
                      else torch.Tensor(input_size)
@@ -118,8 +120,30 @@ class DataEncoder:
         wh = loc_wh.exp() * anchor_boxes[:,2:]
         boxes = torch.cat([xy-wh/2, xy+wh/2], 1)  # [#anchors,4]
 
-        score, labels = cls_preds.sigmoid().max(1)          # [#anchors,]
-        ids = score > CLS_THRESH
-        ids = ids.nonzero().squeeze()             # [#obj,]
-        keep = box_nms(boxes[ids], score[ids], threshold=NMS_THRESH)
-        return boxes[ids][keep], labels[ids][keep]
+        score, labels = cls_preds.sigmoid().max(1)   
+        score_n = score.numpy()
+        CLS_THRESH = score_n.mean()
+        ids = score_n[score_n> 0.1 * CLS_THRESH] 
+        #ids = ids.nonzero().squeeze()
+        #ids = ids.nonzero()
+
+        #keep, count = nms(boxes, score,overlap = 0.7)
+        #keep = keep[:count]
+        #keep = torchvision.ops.nms(boxes, score, iou_threshold = 0.9)
+        boxes_n = boxes.numpy()
+        #ids_n = ids.numpy()
+        print("score, id: ", score_n, ids)
+        keep = numpy_nms(boxes_n, score_n, thresh=NMS_THRESH)
+        #keep = keep[:10]
+        #print("keep: ", keep)
+        #print (boxes, labels)
+        #print("min labels: ", min(labels))
+        #print('len: ', len(boxes))
+        #print('ind: ', (boxes == 0).nonzero())
+        #print(boxes[keep[1]], labels[keep[1]])
+        boxes_n = boxes.numpy()
+        labels_n = labels.numpy()
+        
+       # print("shapes: ", boxes_n[keep].shape, labels[keep].shape)
+
+        return boxes_n[keep], labels_n[keep]

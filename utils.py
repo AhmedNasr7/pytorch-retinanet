@@ -6,6 +6,7 @@ import math
 
 import torch
 import torch.nn as nn
+import numpy as np
 
 
 def get_mean_and_std(dataset, max_load=10000):
@@ -199,6 +200,51 @@ def box_nms(bboxes, scores, threshold=0.5, mode='union'):
         order = order[ids+1]
     return torch.LongTensor(keep)
 
+
+
+def numpy_nms(boxes, scores, thresh):
+
+    #n = scores.shape[0]
+    #scores = scores.reshape((n, 1))
+    #dets = np.concatenate((boxes, scores), axis= 1)
+    '''
+    x1 = dets[:, 0]
+    y1 = dets[:, 1]
+    x2 = dets[:, 2]
+    y2 = dets[:, 3]
+    scores = dets[:, 4]
+    '''
+
+    x1 = boxes[:, 0]
+    y1 = boxes[:, 1]
+    x2 = boxes[:, 2]
+    y2 = boxes[:, 3]
+
+    areas = (x2 - x1 + 1) * (y2 - y1 + 1)
+    order = scores.argsort()[::-1]
+    order = order[:1000]
+    #print("order dims: ", order.shape)
+
+    keep = []
+    while order.size > 0:
+        i = order[0]
+        keep.append(i)
+        xx1 = np.maximum(x1[i], x1[order[1:]])
+        yy1 = np.maximum(y1[i], y1[order[1:]])
+        xx2 = np.minimum(x2[i], x2[order[1:]])
+        yy2 = np.minimum(y2[i], y2[order[1:]])
+
+        w = np.maximum(0.0, xx2 - xx1 + 1)
+        h = np.maximum(0.0, yy2 - yy1 + 1)
+        inter = w * h
+        ovr = inter / (areas[i] + areas[order[1:]] - inter)
+
+        inds = np.where(ovr <= thresh)[0]
+        order = order[inds + 1]
+    #print("count: ", count)
+
+    return keep
+
 def softmax(x):
     '''Softmax along a specific dimension.
 
@@ -213,7 +259,7 @@ def softmax(x):
     x_exp = x_shift.exp()
     return x_exp / x_exp.sum(1).view(-1,1)
 
-def one_hot_embedding(labels, num_classes):
+def one_hot_embedding(labels, num_classes = 5):
     '''Embedding labels to one-hot form.
 
     Args:
@@ -244,6 +290,8 @@ term_width = int(term_width)
 TOTAL_BAR_LENGTH = 86.
 last_time = time.time()
 begin_time = last_time
+
+
 def progress_bar(current, total, msg=None):
     global last_time, begin_time
     if current == 0:
@@ -318,3 +366,78 @@ def format_time(seconds):
     if f == '':
         f = '0ms'
     return f
+
+
+
+def build_targets(
+    pred_boxes, pred_conf, pred_cls, target, anchors, num_anchors, num_classes, grid_size, ignore_thres, img_dim
+):
+    nB = target.size(0)
+    nA = num_anchors
+    nC = num_classes
+    nG = grid_size
+    mask = torch.zeros(nB, nA, nG, nG)
+    conf_mask = torch.ones(nB, nA, nG, nG)
+    tx = torch.zeros(nB, nA, nG, nG)
+    ty = torch.zeros(nB, nA, nG, nG)
+    tw = torch.zeros(nB, nA, nG, nG)
+    th = torch.zeros(nB, nA, nG, nG)
+    tconf = torch.ByteTensor(nB, nA, nG, nG).fill_(0)
+    tcls = torch.ByteTensor(nB, nA, nG, nG, nC).fill_(0)
+
+    nGT = 0
+    nCorrect = 0
+    for b in range(nB):
+        for t in range(target.shape[1]):
+            if target[b, t].sum() == 0:
+                continue
+            nGT += 1
+            # Convert to position relative to box
+            gx = target[b, t, 1] * nG
+            gy = target[b, t, 2] * nG
+            gw = target[b, t, 3] * nG
+            gh = target[b, t, 4] * nG
+            # Get grid box indices
+            gi = int(gx)
+            gj = int(gy)
+            # Get shape of gt box
+            gt_box = torch.FloatTensor(np.array([0, 0, gw, gh])).unsqueeze(0)
+            # Get shape of anchor box
+            anchor_shapes = torch.FloatTensor(np.concatenate((np.zeros((len(anchors), 2)), np.array(anchors)), 1))
+            # Calculate iou between gt and anchor shapes
+            anch_ious = bbox_iou(gt_box, anchor_shapes)
+            # Where the overlap is larger than threshold set mask to zero (ignore)
+            conf_mask[b, anch_ious > ignore_thres, gj, gi] = 0
+            # Find the best matching anchor box
+            best_n = np.argmax(anch_ious)
+            # Get ground truth box
+            gt_box = torch.FloatTensor(np.array([gx, gy, gw, gh])).unsqueeze(0)
+            # Get the best prediction
+            pred_box = pred_boxes[b, best_n, gj, gi].unsqueeze(0)
+            # Masks
+            mask[b, best_n, gj, gi] = 1
+            conf_mask[b, best_n, gj, gi] = 1
+            # Coordinates
+            tx[b, best_n, gj, gi] = gx - gi
+            ty[b, best_n, gj, gi] = gy - gj
+            # Width and height
+            tw[b, best_n, gj, gi] = math.log(gw / anchors[best_n][0] + 1e-16)
+            th[b, best_n, gj, gi] = math.log(gh / anchors[best_n][1] + 1e-16)
+            # One-hot encoding of label
+            target_label = int(target[b, t, 0])
+            tcls[b, best_n, gj, gi, target_label] = 1
+            tconf[b, best_n, gj, gi] = 1
+
+            # Calculate iou between ground truth and best matching prediction
+            iou = bbox_iou(gt_box, pred_box, x1y1x2y2=False)
+            pred_label = torch.argmax(pred_cls[b, best_n, gj, gi])
+            score = pred_conf[b, best_n, gj, gi]
+            if iou > 0.5 and pred_label == target_label and score > 0.5:
+                nCorrect += 1
+
+    return nGT, nCorrect, mask, conf_mask, tx, ty, tw, th, tconf, tcls
+
+
+def to_categorical(y, num_classes):
+    """ 1-hot encodes a tensor """
+    return torch.from_numpy(np.eye(num_classes, dtype="uint8")[y])
